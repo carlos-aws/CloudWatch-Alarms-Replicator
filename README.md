@@ -1,5 +1,7 @@
 # Cross-Account Observability - CloudWatch Alarms Replicator
 
+![diagram](/images/solution_diagram.png)
+
 ### Description
 This proof of concept solution allow you to replicate alarms creation/update/delete operations from Source accounts into a Monitoring account leveraging Amazon EventBridge and AWS Lambda. Based on cross-account EventBridge events of type "CloudWatch Alarm Configuration Change".
 
@@ -18,8 +20,6 @@ This proof of concept solution allow you to replicate alarms creation/update/del
 - Refer to the CloudWatch Alarms pricing documentation for more information: https://aws.amazon.com/cloudwatch/pricing/
 
 ## Setup Instructions
-
-![diagram](/images/solution_diagram.png)
 
 ### Step 1 - In Monitoring Account 
 1. Open the CloudFormation console in the AWS Region where CloudWatch cross-account observability have been previously setup.
