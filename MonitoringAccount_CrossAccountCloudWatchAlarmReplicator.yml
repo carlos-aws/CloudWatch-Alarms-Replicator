@@ -1,0 +1,323 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cross-account CloudWatch alarm replicator. This stack is to be deployed in the Monitoring account of a cross-account Observability setup. This stack should be deployed prior deploying the "SourceAccount_CrossAccountCloudWatchAlarmReplicator" template in the Source account.
+Parameters:
+  OrganizationId:
+    Type: String
+    Default: ''
+    Description: The Organization ID. Add this to allow any account within the organization to send "create", "update" and "delete" alarms events to the monitoring account. (Optional - Either OrganizationId or AccountIds parameters or both should be included)
+  AccountIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: The comma-separated list of Account IDs. Add this to allow this list of specific accounts to send "create", "update" and "delete" alarms events to the monitoring account. (Optional - Either OrganizationId or AccountIds parameters or both should be included)
+  LambdaFunctionName:
+    Type: String
+    Default: CrossAccountAlarmLambdaReplicator
+    Description: The name for the Lambda function creating a copy of CloudWatch alarms from source account in the monitoring account.
+  EventBusName:
+    Type: String
+    Default: CrossAccountAlarmEventBusTracker
+    Description: The name for the custom EventBridge Bus that will be receiving the CloudWatch Alarm "create", "update" and "delete" events.
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: CloudWatchPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricAlarm'
+                  - 'cloudwatch:PutCompositeAlarm'
+                  - 'cloudwatch:DeleteAlarms'
+                Resource: '*'
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Code:
+        ZipFile: |
+          import logging
+          import re
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+          cw_client = boto3.client("cloudwatch")
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+
+          def capitalize_metrics_list(metrics):
+              if isinstance(metrics, list):
+                  return [capitalize_metrics_list(v) for v in metrics]
+              elif isinstance(metrics, dict):
+                  return {
+                      k[0].upper() + k[1:]: capitalize_metrics_list(v) for k, v in metrics.items()
+                  }
+              else:
+                  return metrics
+
+
+          def construct_dimension_list(dimensions):
+              dimension_list = []
+              for dimension in dimensions:
+                  dimension_list.append({"Value": dimensions[dimension], "Name": dimension})
+              return dimension_list
+
+
+          def add_metrics_insights_where_clause(account_id, query):
+              # This function adds the `WHERE AWS.AccountId = '{source_account_id}'` clause to a Metrics Insights query
+              # Split the query into two parts: before and after "WHERE"
+              parts = re.split(r"(?i)WHERE", query)
+
+              # If the query already contains a WHERE clause
+              if len(parts) > 1:
+                  # Add the AccountId condition at the beginning of the existing WHERE clause
+                  modified_query = (
+                      parts[0] + "WHERE AWS.AccountId = '" + account_id + "' AND" + parts[1]
+                  )
+              else:
+                  # Add the AccountId condition as a new WHERE clause and append the rest of the query
+                  parts = re.split(r"(?i)\s*(GROUP BY|ORDER BY|LIMIT)\s*", query, maxsplit=1)
+                  modified_query = (
+                      parts[0]
+                      + " WHERE AWS.AccountId = '"
+                      + account_id
+                      + "' "
+                      + parts[1]
+                      + " "
+                      + parts[2]
+                  )
+
+              return modified_query
+
+
+          def create_update_alarm(event):
+              # In case of composite alarms. Create the alarm with the PutCompositeAlarm operation
+              if "alarmRule" in event["detail"]["configuration"]:
+                  alarm_rule = (
+                      event["detail"]["configuration"]["alarmRule"]
+                      .replace('ALARM("', 'ALARM("' + "[" + event["account"] + "]-")
+                      .replace('OK("', 'OK("' + "[" + event["account"] + "]-")
+                      .replace(
+                          'INSUFFICIENT_DATA("',
+                          'INSUFFICIENT_DATA("' + "[" + event["account"] + "]-",
+                      )
+                  )
+                  alarm_name = "[" + event["account"] + "]-" + event["detail"]["alarmName"]
+                  try:
+                      put_composite_alarm_response = cw_client.put_composite_alarm(
+                          AlarmName=alarm_name,
+                          AlarmDescription=event["detail"]["configuration"]["description"],
+                          AlarmRule=alarm_rule,
+                      )
+                  except ClientError as e:
+                      logger.error(f"Error creating the composite alarm '{alarm_name}': {e}")
+                      return None
+                  return put_composite_alarm_response
+
+              # For any other alarm (e.g. single metric, math expression, anomaly detection and metric insights alarms)
+              threshold_metric_id = None
+              for metric in event["detail"]["configuration"]["metrics"]:
+                  # In case of alarm tracking Metric Insights query. Modify the query with a WHERE filter for the source account.
+                  if "expression" in metric and metric["expression"].startswith("SELECT"):
+                      metric["expression"] = add_metrics_insights_where_clause(
+                          event["account"], metric["expression"]
+                      )
+                  # In case of Anomaly Detection alarm. Retrieve the MetricDataQuery object Id needed for the 'ThresholdMetricId' parameter in the PutMetricAlarm operation.
+                  if (
+                      event["detail"]["configuration"]["comparisonOperator"]
+                      in [
+                          "LessThanLowerOrGreaterThanUpperThreshold",
+                          "LessThanLowerThreshold",
+                          "GreaterThanUpperThreshold",
+                      ]
+                      and "expression" in metric
+                      and metric["expression"].startswith("ANOMALY_DETECTION_BAND")
+                  ):
+                      threshold_metric_id = metric["id"]
+                  # Ensure the "AccountId" key is included for the specific metric(s) to be retrieve
+                  if "metricStat" in metric and "accountId" not in metric:
+                      metric["AccountId"] = event["account"]
+                  # Ensure the "dimensions" array is properly formatted
+                  if "metricStat" in metric:
+                      if "dimensions" in metric["metricStat"]["metric"]:
+                          dimension_list = construct_dimension_list(
+                              metric["metricStat"]["metric"]["dimensions"]
+                          )
+                          metric["metricStat"]["metric"]["dimensions"] = dimension_list
+                      metric["metricStat"]["metric"]["metricName"] = metric["metricStat"][
+                          "metric"
+                      ]["name"]
+                      del metric["metricStat"]["metric"]["name"]
+                  # If the alarm is tracking a single MetricDataQuery object, ensure the Id key is included with a valid value.
+                  if len(event["detail"]["configuration"]["metrics"]) == 1:
+                      metric["Id"] = "m_1"
+
+              # Ensure the first letter each key in the "Metrics" JSON object is capitalized
+              metrics_list = capitalize_metrics_list(event["detail"]["configuration"]["metrics"])
+
+              # Set the "TreatMissingData" parameter to "missing" (which is the default value if not defined)
+              treat_missing_data = event["detail"]["configuration"].get(
+                  "treatMissingData", "missing"
+              )
+
+              # Set the "DatapointsToAlarm" to be equal to the value of "EvaluationPeriods" (which is the default value if not defined)
+              datapoints_to_alarm = event["detail"]["configuration"].get(
+                  "datapointsToAlarm", event["detail"]["configuration"]["evaluationPeriods"]
+              )
+
+              description = event["detail"]["configuration"].get("description", "")
+              alarm_name = "[" + event["account"] + "]-" + event["detail"]["alarmName"]
+
+              # If the Alarm is tracking anomaly detection for a metric, complete the PutMetricAlarm operation including the required ThresholdMetricId parameter
+              if threshold_metric_id is not None:
+                  try:
+                      put_metric_alarm_response = cw_client.put_metric_alarm(
+                          AlarmName=alarm_name,
+                          EvaluationPeriods=event["detail"]["configuration"]["evaluationPeriods"],
+                          DatapointsToAlarm=datapoints_to_alarm,
+                          ThresholdMetricId=threshold_metric_id,
+                          ComparisonOperator=event["detail"]["configuration"][
+                              "comparisonOperator"
+                          ],
+                          TreatMissingData=treat_missing_data,
+                          AlarmDescription=description,
+                          Metrics=metrics_list,
+                      )
+                  except ClientError as e:
+                      logger.error(
+                          f"Error creating the anomaly detection alarm '{alarm_name}': {e}"
+                      )
+                      return None
+                  return put_metric_alarm_response
+
+              # If the Alarm is tracking anomaly detection for a metric, complete the PutMetricAlarm operation including the required Threshold parameter
+              try:
+                  put_metric_alarm_response = cw_client.put_metric_alarm(
+                      AlarmName=alarm_name,
+                      EvaluationPeriods=event["detail"]["configuration"]["evaluationPeriods"],
+                      DatapointsToAlarm=datapoints_to_alarm,
+                      Threshold=event["detail"]["configuration"]["threshold"],
+                      ComparisonOperator=event["detail"]["configuration"]["comparisonOperator"],
+                      TreatMissingData=treat_missing_data,
+                      AlarmDescription=description,
+                      Metrics=metrics_list,
+                  )
+              except ClientError as e:
+                  logger.error(f"Error creating the alarm '{alarm_name}': {e}")
+                  return None
+              return put_metric_alarm_response
+
+
+          def delete_alarm(event):
+              alarm_name = ["[" + event["account"] + "]-" + event["detail"]["alarmName"]]
+              try:
+                  delete_alarms_response = cw_client.delete_alarms(AlarmNames=alarm_name)
+              except ClientError as e:
+                  logger.error(f"Error deleting the alarm '{alarm_name}': {e}")
+                  return None
+              return delete_alarms_response
+
+
+          def lambda_handler(event, context):
+              if event["detail"]["operation"] in ["create", "update"]:
+                  logger.info(
+                      f'[{event["detail"]["operation"]}] operation received for alarm "{event["detail"]["alarmName"]}" in source account "{event["account"]}". Proceeding to {event["detail"]["operation"]} alarm "{"[" + event["account"] + "]-" + event["detail"]["alarmName"]}" in monitoring account.'
+                  )
+                  create_update_alarm(event)
+
+              if event["detail"]["operation"] == "delete":
+                  logger.info(
+                      f'[delete] operation received for alarm "{event["detail"]["alarmName"]}" in source account {event["account"]}. Proceeding to delete alarm "{"[" + event["account"] + "]-" + event["detail"]["alarmName"]}" in monitoring account.'
+                  )
+                  delete_alarm(event)
+
+              return
+
+  CustomEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Ref EventBusName
+
+  EventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      StatementId: cross_account_alarms_replication
+      EventBusName: !Ref CustomEventBus
+      Statement:
+        Sid: cross_account_alarms_replication
+        Effect: Allow
+        Principal: '*'
+        Action: 'events:PutEvents'
+        Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${EventBusName}'
+        Condition:
+          !If
+            - HasBothOrgAndAccounts
+            - ForAnyValue:StringEquals:
+                aws:PrincipalOrgID: [!Ref OrganizationId]
+                aws:SourceAccount: !Ref AccountIds
+            - !If
+              - HasOrganizationId
+              - StringEquals:
+                  aws:PrincipalOrgID: !Ref OrganizationId
+              - StringEquals:
+                  aws:SourceAccount: !Ref AccountIds
+
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${EventBusName}-rule'
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source:
+          - 'aws.cloudwatch'
+        detail-type:
+          - 'CloudWatch Alarm Configuration Change'
+        detail:
+          operation:
+            - 'create'
+            - 'update'
+            - 'delete'
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: !Sub '${LambdaFunctionName}-target'
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt EventRule.Arn
+
+Conditions:
+  HasOrganizationId: !Not [!Equals [!Ref OrganizationId, '']]
+  HasAccountIds: !Not [!Equals [!Join ['', !Ref AccountIds], '']]
+  HasBothOrgAndAccounts: !And
+    - Condition: HasOrganizationId
+    - Condition: HasAccountIds
+
+Outputs:
+  EventBusArn:
+    Description: The ARN of the custom EventBridge Bus
+    Value: !GetAtt CustomEventBus.Arn
+    Export:
+      Name: EventBusArn

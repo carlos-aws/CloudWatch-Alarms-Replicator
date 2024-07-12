@@ -1,0 +1,47 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cross-account CloudWatch alarm replicator. This stack is to be deployed in the source account of a cross-account Observability setup. This stack should be deployed after the "MonitoringAccount_CrossAccountCloudWatchAlarmReplicator" template was deployed in the Monitoring account.
+Parameters:
+  MonitoringAccountEventBusArn:
+    Type: String
+    Description: The ARN of the Custom EventBridge Bus in the monitoring account. 
+Resources:
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: CloudWatchAlarmTrackerEventRule
+      Description: Capture CloudWatch Alarm Configuration Changes
+      EventPattern:
+        source:
+          - 'aws.cloudwatch'
+        detail-type:
+          - 'CloudWatch Alarm Configuration Change'
+        detail:
+          operation:
+            - 'create'
+            - 'update'
+            - 'delete'
+      Targets:
+        - Arn: !Ref MonitoringAccountEventBusArn
+          Id: MonitoringAccountEventBus
+          RoleArn: !GetAtt EventBusAccessRole.Arn
+
+  EventBusAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: PutEventsToEventBus
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'events:PutEvents'
+                Resource: !Ref MonitoringAccountEventBusArn
