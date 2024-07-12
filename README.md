@@ -19,9 +19,11 @@ This proof of concept solution allow you to replicate alarms creation/update/del
 
 ## Setup Instructions
 
+![diagram](/images/solution_diagram.png)
+
 ### Step 1 - In Monitoring Account 
 1. Open the CloudFormation console in the AWS Region where CloudWatch cross-account observability have been previously setup.
-2. Deploy the template [MonitoringAccount_CrossAccountCloudWatchAlarmReplicator.yml]
+2. Deploy the template [MonitoringAccount_CrossAccountCloudWatchAlarmReplicator.yml](templates/MonitoringAccount_CrossAccountCloudWatchAlarmReplicator.yml)
 3. For the template parameters:
    1. *AccountIds*: The comma-separated list of Account IDs. Add this to allow this list of specific accounts to send "create", "update" and "delete" alarms events to the monitoring account. (Optional - Either OrganizationId or AccountIds parameters or both should be included)
    2. *OrganizationId*: The Organization ID. Add this to allow any account within the organization to send "create", "update" and "delete" alarms events to the monitoring account. (Optional - Either OrganizationId or AccountIds parameters or both should be included)
@@ -31,6 +33,6 @@ This proof of concept solution allow you to replicate alarms creation/update/del
 
 ### Step 2 - In Source Account(s)
 1. Open the CloudFormation console in the same AWS Region as in "Step 1" above.
-2. Deploy the template [SourceAccount_CrossAccountCloudWatchAlarmReplicator.yml]
+2. Deploy the template [SourceAccount_CrossAccountCloudWatchAlarmReplicator.yml](templates/SourceAccount_CrossAccountCloudWatchAlarmReplicator.yml)
 3. For the template parameters:
    1. *MonitoringAccountEventBusArn*: Add the value of the **EventBusArn** from "Step 1" above.
