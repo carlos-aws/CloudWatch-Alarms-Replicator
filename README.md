@@ -11,7 +11,7 @@ This proof of concept solution allow you to replicate alarms creation/update/del
 - Alarms are created in the "Monitoring" account following a naming convention as “[<SOURCE_ACCOUNT_ID>]-<ALARM_NAME>”
 - Alarms’ related actions are not replicated.
 - Consider increasing the TPS quotas of the CloudWatch PutMetricAlarm and PutCompositeAlarm operations (to avoid throttling errors in the "Monitoring" account). For DeleteAlarms operation, currently, limits cannot be increased.
-- It is recommended to have a separate logic/solution to rebase the alarm in the monitoring account (something that can be ran before implementing this solution to ensure parity)
+- It is recommended to have a separate logic/solution to rebase the alarms in the monitoring account (something that can be ran before implementing this solution to ensure parity)
 
 ### Cost
 - There is a cost associated for each CloudWatch Alarms created in an account. This solution will create a copy of every new CloudWatch Alarms from a "Source" account into the "Monitoring" account.For this, there will be a cost of each new alarm copied in the "Monitoring" account.
