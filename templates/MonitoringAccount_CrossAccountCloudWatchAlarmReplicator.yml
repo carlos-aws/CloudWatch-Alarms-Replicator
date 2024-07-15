@@ -4,19 +4,11 @@ Parameters:
   OrganizationId:
     Type: String
     Default: ''
-    Description: The Organization ID. Add this to allow any account within the organization to send "create", "update" and "delete" alarms events to the monitoring account. (Optional - Either OrganizationId or AccountIds parameters or both should be included)
+    Description: The Organization ID. Add this to allow any account within the organization to send "create", "update" and "delete" alarms events to the monitoring account. (Note - Add either OrganizationId parameter or AccountIds parameter for deploying the stack, not both)
   AccountIds:
     Type: CommaDelimitedList
     Default: ''
-    Description: The comma-separated list of Account IDs. Add this to allow this list of specific accounts to send "create", "update" and "delete" alarms events to the monitoring account. (Optional - Either OrganizationId or AccountIds parameters or both should be included)
-  LambdaFunctionName:
-    Type: String
-    Default: CrossAccountAlarmLambdaReplicator
-    Description: The name for the Lambda function creating a copy of CloudWatch alarms from source account in the monitoring account.
-  EventBusName:
-    Type: String
-    Default: CrossAccountAlarmEventBusTracker
-    Description: The name for the custom EventBridge Bus that will be receiving the CloudWatch Alarm "create", "update" and "delete" events.
+    Description: The comma-separated list of Account IDs. Add this to allow this list of specific accounts to send "create", "update" and "delete" alarms events to the monitoring account. (Note - Add either OrganizationId parameter or AccountIds parameter for deploying the stack, not both)
 Resources:
   LambdaExecutionRole:
     Type: AWS::IAM::Role
@@ -44,10 +36,9 @@ Resources:
                   - 'cloudwatch:DeleteAlarms'
                 Resource: '*'
 
-  LambdaFunction:
+  CrossAccountAlarmLambdaReplicator:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Ref LambdaFunctionName
       Role: !GetAtt LambdaExecutionRole.Arn
       Handler: index.lambda_handler
       Runtime: python3.12
@@ -252,22 +243,34 @@ Resources:
 
               return
 
-  CustomEventBus:
+  CrossAccountAlarmEventBusTracker:
     Type: AWS::Events::EventBus
     Properties:
-      Name: !Ref EventBusName
+      Name:
+        Fn::Join:
+          - '-'
+          - - CrossAccountAlarmEventBusTracker
+            - Fn::Select:
+                - 4
+                - Fn::Split:
+                    - '-'
+                    - Fn::Select:
+                        - 2
+                        - Fn::Split:
+                            - /
+                            - Ref: AWS::StackId
 
   EventBusPolicy:
     Type: AWS::Events::EventBusPolicy
     Properties:
       StatementId: cross_account_alarms_replication
-      EventBusName: !Ref CustomEventBus
+      EventBusName: !Ref CrossAccountAlarmEventBusTracker
       Statement:
         Sid: cross_account_alarms_replication
         Effect: Allow
         Principal: '*'
         Action: 'events:PutEvents'
-        Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${EventBusName}'
+        Resource: !GetAtt CrossAccountAlarmEventBusTracker.Arn
         Condition:
           !If
             - HasBothOrgAndAccounts
@@ -284,8 +287,7 @@ Resources:
   EventRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub '${EventBusName}-rule'
-      EventBusName: !Ref CustomEventBus
+      EventBusName: !Ref CrossAccountAlarmEventBusTracker
       EventPattern:
         source:
           - 'aws.cloudwatch'
@@ -297,13 +299,13 @@ Resources:
             - 'update'
             - 'delete'
       Targets:
-        - Arn: !GetAtt LambdaFunction.Arn
-          Id: !Sub '${LambdaFunctionName}-target'
+        - Arn: !GetAtt CrossAccountAlarmLambdaReplicator.Arn
+          Id: !Sub 'LambdaReplicator-target'
 
   LambdaPermission:
     Type: AWS::Lambda::Permission
     Properties:
-      FunctionName: !Ref LambdaFunction
+      FunctionName: !Ref CrossAccountAlarmLambdaReplicator
       Action: 'lambda:InvokeFunction'
       Principal: 'events.amazonaws.com'
       SourceArn: !GetAtt EventRule.Arn
@@ -318,6 +320,6 @@ Conditions:
 Outputs:
   EventBusArn:
     Description: The ARN of the custom EventBridge Bus
-    Value: !GetAtt CustomEventBus.Arn
+    Value: !GetAtt CrossAccountAlarmEventBusTracker.Arn
     Export:
       Name: EventBusArn
